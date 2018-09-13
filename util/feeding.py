@@ -8,6 +8,7 @@ from util.audio import audiofile_to_input_vector
 from util.gpu import get_available_gpus
 from util.text import ctc_label_dense_to_sparse, text_to_char_array
 
+
 class ModelFeeder(object):
     '''
     Feeds data into a model.
@@ -16,6 +17,7 @@ class ModelFeeder(object):
     These sources are to be provided by three DataSet instances whos references are kept.
     Creates, owns and delegates to tower_feeder_count internal tower feeder objects.
     '''
+
     def __init__(self,
                  train_set,
                  dev_set,
@@ -37,7 +39,7 @@ class ModelFeeder(object):
 
         self.ph_x = tf.placeholder(tf.float32, [None, numcep + (2 * numcep * numcontext)])
         self.ph_x_length = tf.placeholder(tf.int32, [])
-        self.ph_y = tf.placeholder(tf.int32, [None,])
+        self.ph_y = tf.placeholder(tf.int32, [None, ])
         self.ph_y_length = tf.placeholder(tf.int32, [])
         self.ph_batch_size = tf.placeholder(tf.int32, [])
         self.ph_queue_selector = tf.placeholder(tf.int32, name='Queue_Selector')
@@ -77,11 +79,13 @@ class ModelFeeder(object):
         '''
         return self._tower_feeders[tower_feeder_index].next_batch()
 
+
 class DataSet(object):
     '''
     Represents a collection of audio samples and their respective transcriptions.
     Takes a set of CSV files produced by importers in /bin.
     '''
+
     def __init__(self, csvs, batch_size, skip=0, limit=0, ascending=True, next_index=lambda i: i + 1):
         self.batch_size = batch_size
         self.next_index = next_index
@@ -99,6 +103,7 @@ class DataSet(object):
             self.files = self.files[:limit]
         self.total_batches = int(ceil(len(self.files) / batch_size))
 
+
 class _DataSetLoader(object):
     '''
     Internal class that represents an input queue with data from one of the DataSet objects.
@@ -106,13 +111,17 @@ class _DataSetLoader(object):
     Keeps a ModelFeeder reference for accessing shared settings and placeholders.
     Keeps a DataSet reference to access its samples.
     '''
+
     def __init__(self, model_feeder, data_set, alphabet):
         self._model_feeder = model_feeder
         self._data_set = data_set
-        self.queue = tf.PaddingFIFOQueue(shapes=[[None, model_feeder.numcep + (2 * model_feeder.numcep * model_feeder.numcontext)], [], [None,], []],
-                                                  dtypes=[tf.float32, tf.int32, tf.int32, tf.int32],
-                                                  capacity=data_set.batch_size * 2)
-        self._enqueue_op = self.queue.enqueue([model_feeder.ph_x, model_feeder.ph_x_length, model_feeder.ph_y, model_feeder.ph_y_length])
+        self.queue = tf.PaddingFIFOQueue(
+            shapes=[[None, model_feeder.numcep + (2 * model_feeder.numcep * model_feeder.numcontext)], [], [None, ],
+                    []],
+            dtypes=[tf.float32, tf.int32, tf.int32, tf.int32],
+            capacity=data_set.batch_size * 2)
+        self._enqueue_op = self.queue.enqueue(
+            [model_feeder.ph_x, model_feeder.ph_x_length, model_feeder.ph_y, model_feeder.ph_y_length])
         self._close_op = self.queue.close(cancel_pending_enqueues=True)
         self._alphabet = alphabet
 
@@ -150,12 +159,13 @@ class _DataSetLoader(object):
             if source_len < target_len:
                 raise ValueError('Error: Audio file {} is too short for transcription.'.format(wav_file))
             try:
-                session.run(self._enqueue_op, feed_dict={ self._model_feeder.ph_x: source,
-                                                          self._model_feeder.ph_x_length: source_len,
-                                                          self._model_feeder.ph_y: target,
-                                                          self._model_feeder.ph_y_length: target_len })
+                session.run(self._enqueue_op, feed_dict={self._model_feeder.ph_x: source,
+                                                         self._model_feeder.ph_x_length: source_len,
+                                                         self._model_feeder.ph_y: target,
+                                                         self._model_feeder.ph_y_length: target_len})
             except tf.errors.CancelledError:
                 return
+
 
 class _TowerFeeder(object):
     '''
@@ -163,6 +173,7 @@ class _TowerFeeder(object):
     It creates, owns and combines three _DataSetLoader instances.
     Keeps a ModelFeeder reference for accessing shared settings and placeholders.
     '''
+
     def __init__(self, model_feeder, index, alphabet):
         self._model_feeder = model_feeder
         self.index = index
@@ -194,4 +205,3 @@ class _TowerFeeder(object):
         '''
         for set_queue in self._loaders:
             set_queue.close_queue(session)
-

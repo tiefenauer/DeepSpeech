@@ -6,172 +6,207 @@ import os
 import sys
 
 log_level_index = sys.argv.index('--log_level') + 1 if '--log_level' in sys.argv else 0
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = sys.argv[log_level_index] if log_level_index > 0 and log_level_index < len(sys.argv) else '3'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = sys.argv[log_level_index] if log_level_index > 0 and log_level_index < len(
+    sys.argv) else '3'
 
 import datetime
 import pickle
 import shutil
-import six
 import subprocess
 import tensorflow as tf
 import time
 import traceback
-import inspect
 import progressbar
 
-from functools import partial
 from six.moves import zip, range, filter, urllib, BaseHTTPServer
 from tensorflow.python.tools import freeze_graph
 from threading import Thread, Lock
 from util.audio import audiofile_to_input_vector
 from util.feeding import DataSet, ModelFeeder
 from util.gpu import get_available_gpus
-from util.shared_lib import check_cupti
-from util.text import sparse_tensor_value_to_texts, wer, levenshtein, Alphabet, ndarray_to_text
+from util.text import sparse_tensor_value_to_texts, wer, levenshtein, Alphabet
 from xdg import BaseDirectory as xdg
 import numpy as np
+
 
 def create_flags():
     # Importer
     # ========
 
-    tf.app.flags.DEFINE_string  ('train_files',      '',          'comma separated list of files specifying the dataset used for training. multiple files will get merged')
-    tf.app.flags.DEFINE_string  ('dev_files',        '',          'comma separated list of files specifying the dataset used for validation. multiple files will get merged')
-    tf.app.flags.DEFINE_string  ('test_files',       '',          'comma separated list of files specifying the dataset used for testing. multiple files will get merged')
-    tf.app.flags.DEFINE_boolean ('fulltrace',        False,       'if full trace debug info should be generated during training')
+    tf.app.flags.DEFINE_string('train_files', '',
+                               'comma separated list of files specifying the dataset used for training. multiple files will get merged')
+    tf.app.flags.DEFINE_string('dev_files', '',
+                               'comma separated list of files specifying the dataset used for validation. multiple files will get merged')
+    tf.app.flags.DEFINE_string('test_files', '',
+                               'comma separated list of files specifying the dataset used for testing. multiple files will get merged')
+    tf.app.flags.DEFINE_boolean('fulltrace', False, 'if full trace debug info should be generated during training')
 
     # Cluster configuration
     # =====================
 
-    tf.app.flags.DEFINE_string  ('ps_hosts',         '',          'parameter servers - comma separated list of hostname:port pairs')
-    tf.app.flags.DEFINE_string  ('worker_hosts',     '',          'workers - comma separated list of hostname:port pairs')
-    tf.app.flags.DEFINE_string  ('job_name',         'localhost', 'job name - one of localhost (default), worker, ps')
-    tf.app.flags.DEFINE_integer ('task_index',       0,           'index of task within the job - worker with index 0 will be the chief')
-    tf.app.flags.DEFINE_integer ('replicas',         -1,          'total number of replicas - if negative, its absolute value is multiplied by the number of workers')
-    tf.app.flags.DEFINE_integer ('replicas_to_agg',  -1,          'number of replicas to aggregate - if negative, its absolute value is multiplied by the number of workers')
-    tf.app.flags.DEFINE_integer ('coord_retries',    100,         'number of tries of workers connecting to training coordinator before failing')
-    tf.app.flags.DEFINE_string  ('coord_host',       'localhost', 'coordination server host')
-    tf.app.flags.DEFINE_integer ('coord_port',       2500,        'coordination server port')
-    tf.app.flags.DEFINE_integer ('iters_per_worker', 1,           'number of train or inference iterations per worker before results are sent back to coordinator')
+    tf.app.flags.DEFINE_string('ps_hosts', '', 'parameter servers - comma separated list of hostname:port pairs')
+    tf.app.flags.DEFINE_string('worker_hosts', '', 'workers - comma separated list of hostname:port pairs')
+    tf.app.flags.DEFINE_string('job_name', 'localhost', 'job name - one of localhost (default), worker, ps')
+    tf.app.flags.DEFINE_integer('task_index', 0, 'index of task within the job - worker with index 0 will be the chief')
+    tf.app.flags.DEFINE_integer('replicas', -1,
+                                'total number of replicas - if negative, its absolute value is multiplied by the number of workers')
+    tf.app.flags.DEFINE_integer('replicas_to_agg', -1,
+                                'number of replicas to aggregate - if negative, its absolute value is multiplied by the number of workers')
+    tf.app.flags.DEFINE_integer('coord_retries', 100,
+                                'number of tries of workers connecting to training coordinator before failing')
+    tf.app.flags.DEFINE_string('coord_host', 'localhost', 'coordination server host')
+    tf.app.flags.DEFINE_integer('coord_port', 2500, 'coordination server port')
+    tf.app.flags.DEFINE_integer('iters_per_worker', 1,
+                                'number of train or inference iterations per worker before results are sent back to coordinator')
 
     # Global Constants
     # ================
 
-    tf.app.flags.DEFINE_boolean ('train',            True,        'whether to train the network')
-    tf.app.flags.DEFINE_boolean ('test',             True,        'whether to test the network')
-    tf.app.flags.DEFINE_integer ('epoch',            75,          'target epoch to train - if negative, the absolute number of additional epochs will be trained')
+    tf.app.flags.DEFINE_boolean('train', True, 'whether to train the network')
+    tf.app.flags.DEFINE_boolean('test', True, 'whether to test the network')
+    tf.app.flags.DEFINE_integer('epoch', 75,
+                                'target epoch to train - if negative, the absolute number of additional epochs will be trained')
 
-    tf.app.flags.DEFINE_boolean ('use_warpctc',      False,       'whether to use GPU bound Warp-CTC')
+    tf.app.flags.DEFINE_boolean('use_warpctc', False, 'whether to use GPU bound Warp-CTC')
 
-    tf.app.flags.DEFINE_float   ('dropout_rate',     0.05,        'dropout rate for feedforward layers')
-    tf.app.flags.DEFINE_float   ('dropout_rate2',    -1.0,        'dropout rate for layer 2 - defaults to dropout_rate')
-    tf.app.flags.DEFINE_float   ('dropout_rate3',    -1.0,        'dropout rate for layer 3 - defaults to dropout_rate')
-    tf.app.flags.DEFINE_float   ('dropout_rate4',    0.0,         'dropout rate for layer 4 - defaults to 0.0')
-    tf.app.flags.DEFINE_float   ('dropout_rate5',    0.0,         'dropout rate for layer 5 - defaults to 0.0')
-    tf.app.flags.DEFINE_float   ('dropout_rate6',    -1.0,        'dropout rate for layer 6 - defaults to dropout_rate')
+    tf.app.flags.DEFINE_float('dropout_rate', 0.05, 'dropout rate for feedforward layers')
+    tf.app.flags.DEFINE_float('dropout_rate2', -1.0, 'dropout rate for layer 2 - defaults to dropout_rate')
+    tf.app.flags.DEFINE_float('dropout_rate3', -1.0, 'dropout rate for layer 3 - defaults to dropout_rate')
+    tf.app.flags.DEFINE_float('dropout_rate4', 0.0, 'dropout rate for layer 4 - defaults to 0.0')
+    tf.app.flags.DEFINE_float('dropout_rate5', 0.0, 'dropout rate for layer 5 - defaults to 0.0')
+    tf.app.flags.DEFINE_float('dropout_rate6', -1.0, 'dropout rate for layer 6 - defaults to dropout_rate')
 
-    tf.app.flags.DEFINE_float   ('relu_clip',        20.0,        'ReLU clipping value for non-recurrant layers')
+    tf.app.flags.DEFINE_float('relu_clip', 20.0, 'ReLU clipping value for non-recurrant layers')
 
     # Adam optimizer (http://arxiv.org/abs/1412.6980) parameters
 
-    tf.app.flags.DEFINE_float   ('beta1',            0.9,         'beta 1 parameter of Adam optimizer')
-    tf.app.flags.DEFINE_float   ('beta2',            0.999,       'beta 2 parameter of Adam optimizer')
-    tf.app.flags.DEFINE_float   ('epsilon',          1e-8,        'epsilon parameter of Adam optimizer')
-    tf.app.flags.DEFINE_float   ('learning_rate',    0.001,       'learning rate of Adam optimizer')
+    tf.app.flags.DEFINE_float('beta1', 0.9, 'beta 1 parameter of Adam optimizer')
+    tf.app.flags.DEFINE_float('beta2', 0.999, 'beta 2 parameter of Adam optimizer')
+    tf.app.flags.DEFINE_float('epsilon', 1e-8, 'epsilon parameter of Adam optimizer')
+    tf.app.flags.DEFINE_float('learning_rate', 0.001, 'learning rate of Adam optimizer')
 
     # Batch sizes
 
-    tf.app.flags.DEFINE_integer ('train_batch_size', 1,           'number of elements in a training batch')
-    tf.app.flags.DEFINE_integer ('dev_batch_size',   1,           'number of elements in a validation batch')
-    tf.app.flags.DEFINE_integer ('test_batch_size',  1,           'number of elements in a test batch')
+    tf.app.flags.DEFINE_integer('train_batch_size', 1, 'number of elements in a training batch')
+    tf.app.flags.DEFINE_integer('dev_batch_size', 1, 'number of elements in a validation batch')
+    tf.app.flags.DEFINE_integer('test_batch_size', 1, 'number of elements in a test batch')
 
-    tf.app.flags.DEFINE_integer ('export_batch_size', 1,          'number of elements per batch on the exported graph')
+    tf.app.flags.DEFINE_integer('export_batch_size', 1, 'number of elements per batch on the exported graph')
 
     # Performance (UNSUPPORTED)
-    tf.app.flags.DEFINE_integer ('inter_op_parallelism_threads', 0, 'number of inter-op parallelism threads - see tf.ConfigProto for more details')
-    tf.app.flags.DEFINE_integer ('intra_op_parallelism_threads', 0, 'number of intra-op parallelism threads - see tf.ConfigProto for more details')
+    tf.app.flags.DEFINE_integer('inter_op_parallelism_threads', 0,
+                                'number of inter-op parallelism threads - see tf.ConfigProto for more details')
+    tf.app.flags.DEFINE_integer('intra_op_parallelism_threads', 0,
+                                'number of intra-op parallelism threads - see tf.ConfigProto for more details')
 
     # Sample limits
 
-    tf.app.flags.DEFINE_integer ('limit_train',      0,           'maximum number of elements to use from train set - 0 means no limit')
-    tf.app.flags.DEFINE_integer ('limit_dev',        0,           'maximum number of elements to use from validation set- 0 means no limit')
-    tf.app.flags.DEFINE_integer ('limit_test',       0,           'maximum number of elements to use from test set- 0 means no limit')
+    tf.app.flags.DEFINE_integer('limit_train', 0, 'maximum number of elements to use from train set - 0 means no limit')
+    tf.app.flags.DEFINE_integer('limit_dev', 0,
+                                'maximum number of elements to use from validation set- 0 means no limit')
+    tf.app.flags.DEFINE_integer('limit_test', 0, 'maximum number of elements to use from test set- 0 means no limit')
 
     # Step widths
 
-    tf.app.flags.DEFINE_integer ('display_step',     0,           'number of epochs we cycle through before displaying detailed progress - 0 means no progress display')
-    tf.app.flags.DEFINE_integer ('validation_step',  0,           'number of epochs we cycle through before validating the model - a detailed progress report is dependent on "--display_step" - 0 means no validation steps')
+    tf.app.flags.DEFINE_integer('display_step', 0,
+                                'number of epochs we cycle through before displaying detailed progress - 0 means no progress display')
+    tf.app.flags.DEFINE_integer('validation_step', 0,
+                                'number of epochs we cycle through before validating the model - a detailed progress report is dependent on "--display_step" - 0 means no validation steps')
 
     # Checkpointing
 
-    tf.app.flags.DEFINE_string  ('checkpoint_dir',   '',          'directory in which checkpoints are stored - defaults to directory "deepspeech/checkpoints" within user\'s data home specified by the XDG Base Directory Specification')
-    tf.app.flags.DEFINE_integer ('checkpoint_secs',  600,         'checkpoint saving interval in seconds')
-    tf.app.flags.DEFINE_integer ('max_to_keep',      5,           'number of checkpoint files to keep - default value is 5')
+    tf.app.flags.DEFINE_string('checkpoint_dir', '',
+                               'directory in which checkpoints are stored - defaults to directory "deepspeech/checkpoints" within user\'s data home specified by the XDG Base Directory Specification')
+    tf.app.flags.DEFINE_integer('checkpoint_secs', 600, 'checkpoint saving interval in seconds')
+    tf.app.flags.DEFINE_integer('max_to_keep', 5, 'number of checkpoint files to keep - default value is 5')
 
     # Exporting
 
-    tf.app.flags.DEFINE_string  ('export_dir',       '',          'directory in which exported models are stored - if omitted, the model won\'t get exported')
-    tf.app.flags.DEFINE_integer ('export_version',   1,           'version number of the exported model')
-    tf.app.flags.DEFINE_boolean ('remove_export',    False,       'whether to remove old exported models')
-    tf.app.flags.DEFINE_boolean ('use_seq_length',   True,        'have sequence_length in the exported graph (will make tfcompile unhappy)')
-    tf.app.flags.DEFINE_integer ('n_steps',          16,          'how many timesteps to process at once by the export graph, higher values mean more latency')
+    tf.app.flags.DEFINE_string('export_dir', '',
+                               'directory in which exported models are stored - if omitted, the model won\'t get exported')
+    tf.app.flags.DEFINE_integer('export_version', 1, 'version number of the exported model')
+    tf.app.flags.DEFINE_boolean('remove_export', False, 'whether to remove old exported models')
+    tf.app.flags.DEFINE_boolean('use_seq_length', True,
+                                'have sequence_length in the exported graph (will make tfcompile unhappy)')
+    tf.app.flags.DEFINE_integer('n_steps', 16,
+                                'how many timesteps to process at once by the export graph, higher values mean more latency')
 
     # Reporting
 
-    tf.app.flags.DEFINE_integer ('log_level',        1,           'log level for console logs - 0: INFO, 1: WARN, 2: ERROR, 3: FATAL')
-    tf.app.flags.DEFINE_boolean ('log_traffic',      False,       'log cluster transaction and traffic information during debug logging')
-    tf.app.flags.DEFINE_boolean ('show_progressbar', True,        'Show progress for training, validation and testing processes. Log level should be > 0.')
+    tf.app.flags.DEFINE_integer('log_level', 1, 'log level for console logs - 0: INFO, 1: WARN, 2: ERROR, 3: FATAL')
+    tf.app.flags.DEFINE_boolean('log_traffic', False,
+                                'log cluster transaction and traffic information during debug logging')
+    tf.app.flags.DEFINE_boolean('show_progressbar', True,
+                                'Show progress for training, validation and testing processes. Log level should be > 0.')
 
-    tf.app.flags.DEFINE_string  ('wer_log_pattern',  '',          'pattern for machine readable global logging of WER progress; has to contain %%s, %%s and %%f for the set name, the date and the float respectively; example: "GLOBAL LOG: logwer(\'12ade231\', %%s, %%s, %%f)" would result in some entry like "GLOBAL LOG: logwer(\'12ade231\', \'train\', \'2017-05-18T03:09:48-0700\', 0.05)"; if omitted (default), there will be no logging')
+    tf.app.flags.DEFINE_string('wer_log_pattern', '',
+                               'pattern for machine readable global logging of WER progress; has to contain %%s, %%s and %%f for the set name, the date and the float respectively; example: "GLOBAL LOG: logwer(\'12ade231\', %%s, %%s, %%f)" would result in some entry like "GLOBAL LOG: logwer(\'12ade231\', \'train\', \'2017-05-18T03:09:48-0700\', 0.05)"; if omitted (default), there will be no logging')
 
-    tf.app.flags.DEFINE_boolean ('log_placement',    False,       'whether to log device placement of the operators to the console')
-    tf.app.flags.DEFINE_integer ('report_count',     10,          'number of phrases with lowest WER (best matching) to print out during a WER report')
+    tf.app.flags.DEFINE_boolean('log_placement', False,
+                                'whether to log device placement of the operators to the console')
+    tf.app.flags.DEFINE_integer('report_count', 10,
+                                'number of phrases with lowest WER (best matching) to print out during a WER report')
 
-    tf.app.flags.DEFINE_string  ('summary_dir',      '',          'target directory for TensorBoard summaries - defaults to directory "deepspeech/summaries" within user\'s data home specified by the XDG Base Directory Specification')
-    tf.app.flags.DEFINE_integer ('summary_secs',     0,           'interval in seconds for saving TensorBoard summaries - if 0, no summaries will be written')
+    tf.app.flags.DEFINE_string('summary_dir', '',
+                               'target directory for TensorBoard summaries - defaults to directory "deepspeech/summaries" within user\'s data home specified by the XDG Base Directory Specification')
+    tf.app.flags.DEFINE_integer('summary_secs', 0,
+                                'interval in seconds for saving TensorBoard summaries - if 0, no summaries will be written')
 
     # Geometry
 
-    tf.app.flags.DEFINE_integer ('n_hidden',         2048,        'layer width to use when initialising layers')
+    tf.app.flags.DEFINE_integer('n_hidden', 2048, 'layer width to use when initialising layers')
 
     # Initialization
 
-    tf.app.flags.DEFINE_integer ('random_seed',      4567,        'default random seed that is used to initialize variables')
+    tf.app.flags.DEFINE_integer('random_seed', 4567, 'default random seed that is used to initialize variables')
 
     # Early Stopping
 
-    tf.app.flags.DEFINE_boolean ('early_stop',       True,        'enable early stopping mechanism over validation dataset. Make sure that dev FLAG is enabled for this to work')
+    tf.app.flags.DEFINE_boolean('early_stop', True,
+                                'enable early stopping mechanism over validation dataset. Make sure that dev FLAG is enabled for this to work')
 
     # This parameter is irrespective of the time taken by single epoch to complete and checkpoint saving intervals.
     # It is possible that early stopping is triggered far after the best checkpoint is already replaced by checkpoint saving interval mechanism.
     # One has to align the parameters (earlystop_nsteps, checkpoint_secs) accordingly as per the time taken by an epoch on different datasets.
 
-    tf.app.flags.DEFINE_integer ('earlystop_nsteps',  4,          'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
-    tf.app.flags.DEFINE_float   ('estop_mean_thresh', 0.5,        'mean threshold for loss to determine the condition if early stopping is required')
-    tf.app.flags.DEFINE_float   ('estop_std_thresh',  0.5,        'standard deviation threshold for loss to determine the condition if early stopping is required')
+    tf.app.flags.DEFINE_integer('earlystop_nsteps', 4,
+                                'number of steps to consider for early stopping. Loss is not stored in the checkpoint so when checkpoint is revived it starts the loss calculation from start at that point')
+    tf.app.flags.DEFINE_float('estop_mean_thresh', 0.5,
+                              'mean threshold for loss to determine the condition if early stopping is required')
+    tf.app.flags.DEFINE_float('estop_std_thresh', 0.5,
+                              'standard deviation threshold for loss to determine the condition if early stopping is required')
 
     # Decoder
 
-    tf.app.flags.DEFINE_string  ('decoder_library_path', 'native_client/libctc_decoder_with_kenlm.so', 'path to the libctc_decoder_with_kenlm.so library containing the decoder implementation.')
-    tf.app.flags.DEFINE_string  ('alphabet_config_path', 'data/alphabet.txt', 'path to the configuration file specifying the alphabet used by the network. See the comment in data/alphabet.txt for a description of the format.')
-    tf.app.flags.DEFINE_string  ('lm_binary_path',       'data/lm/lm.binary', 'path to the language model binary file created with KenLM')
-    tf.app.flags.DEFINE_string  ('lm_trie_path',         'data/lm/trie', 'path to the language model trie file created with native_client/generate_trie')
-    tf.app.flags.DEFINE_integer ('beam_width',        1024,       'beam width used in the CTC decoder when building candidate transcriptions')
-    tf.app.flags.DEFINE_float   ('lm_weight',         1.75,       'the alpha hyperparameter of the CTC decoder. Language Model weight.')
-    tf.app.flags.DEFINE_float   ('valid_word_count_weight', 1.00, 'valid word insertion weight. This is used to lessen the word insertion penalty when the inserted word is part of the vocabulary.')
+    tf.app.flags.DEFINE_string('decoder_library_path', 'native_client/libctc_decoder_with_kenlm.so',
+                               'path to the libctc_decoder_with_kenlm.so library containing the decoder implementation.')
+    tf.app.flags.DEFINE_string('alphabet_config_path', 'data/alphabet.txt',
+                               'path to the configuration file specifying the alphabet used by the network. See the comment in data/alphabet.txt for a description of the format.')
+    tf.app.flags.DEFINE_string('lm_binary_path', 'data/lm/lm.binary',
+                               'path to the language model binary file created with KenLM')
+    tf.app.flags.DEFINE_string('lm_trie_path', 'data/lm/trie',
+                               'path to the language model trie file created with native_client/generate_trie')
+    tf.app.flags.DEFINE_integer('beam_width', 1024,
+                                'beam width used in the CTC decoder when building candidate transcriptions')
+    tf.app.flags.DEFINE_float('lm_weight', 1.75, 'the alpha hyperparameter of the CTC decoder. Language Model weight.')
+    tf.app.flags.DEFINE_float('valid_word_count_weight', 1.00,
+                              'valid word insertion weight. This is used to lessen the word insertion penalty when the inserted word is part of the vocabulary.')
 
     # Inference mode
 
-    tf.app.flags.DEFINE_string  ('one_shot_infer',       '',       'one-shot inference mode: specify a wav file and the script will load the checkpoint and perform inference on it. Disables training, testing and exporting.')
+    tf.app.flags.DEFINE_string('one_shot_infer', '',
+                               'one-shot inference mode: specify a wav file and the script will load the checkpoint and perform inference on it. Disables training, testing and exporting.')
 
     # Initialize from frozen model
 
-    tf.app.flags.DEFINE_string  ('initialize_from_frozen_model', '', 'path to frozen model to initialize from. This behaves like a checkpoint, loading the weights from the frozen model and starting training with those weights. The optimizer parameters aren\'t restored, so remember to adjust the learning rate.')
+    tf.app.flags.DEFINE_string('initialize_from_frozen_model', '',
+                               'path to frozen model to initialize from. This behaves like a checkpoint, loading the weights from the frozen model and starting training with those weights. The optimizer parameters aren\'t restored, so remember to adjust the learning rate.')
+
 
 FLAGS = tf.app.flags.FLAGS
 
-def initialize_globals():
 
+def initialize_globals():
     # ps and worker hosts required for p2p cluster setup
     FLAGS.ps_hosts = list(filter(len, FLAGS.ps_hosts.split(',')))
     FLAGS.worker_hosts = list(filter(len, FLAGS.worker_hosts.split(',')))
@@ -227,15 +262,15 @@ def initialize_globals():
     dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
 
     global no_dropout
-    no_dropout = [ 0.0 ] * 6
+    no_dropout = [0.0] * 6
 
     # Set default checkpoint dir
     if len(FLAGS.checkpoint_dir) == 0:
-        FLAGS.checkpoint_dir = xdg.save_data_path(os.path.join('deepspeech','checkpoints'))
+        FLAGS.checkpoint_dir = xdg.save_data_path(os.path.join('deepspeech', 'checkpoints'))
 
     # Set default summary dir
     if len(FLAGS.summary_dir) == 0:
-        FLAGS.summary_dir = xdg.save_data_path(os.path.join('deepspeech','summaries'))
+        FLAGS.summary_dir = xdg.save_data_path(os.path.join('deepspeech', 'summaries'))
 
     # Standard session configuration that'll be used for all new sessions.
     global session_config
@@ -254,11 +289,11 @@ def initialize_globals():
 
     # Number of MFCC features
     global n_input
-    n_input = 26 # TODO: Determine this programatically from the sample rate
+    n_input = 26  # TODO: Determine this programatically from the sample rate
 
     # The number of frames in the context
     global n_context
-    n_context = 9 # TODO: Determine the optimal value using a validation data set
+    n_context = 9  # TODO: Determine the optimal value using a validation data set
 
     # Number of units in hidden layers
     global n_hidden
@@ -283,7 +318,7 @@ def initialize_globals():
 
     # The number of characters in the target language plus one
     global n_character
-    n_character = alphabet.size() + 1 # +1 for CTC blank label
+    n_character = alphabet.size() + 1  # +1 for CTC blank label
 
     # The number of units in the sixth layer
     global n_hidden_6
@@ -336,21 +371,26 @@ def initialize_globals():
 def prefix_print(prefix, message):
     print(prefix + ('\n' + prefix).join(message.split('\n')))
 
+
 def log_debug(message):
     if FLAGS.log_level == 0:
         prefix_print('D ', message)
+
 
 def log_traffic(message):
     if FLAGS.log_traffic:
         log_debug(message)
 
+
 def log_info(message):
     if FLAGS.log_level <= 1:
         prefix_print('I ', message)
 
+
 def log_warn(message):
     if FLAGS.log_level <= 2:
         prefix_print('W ', message)
+
 
 def log_error(message):
     if FLAGS.log_level <= 3:
@@ -404,7 +444,8 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     # Permute n_steps and batch_size
     batch_x = tf.transpose(batch_x, [1, 0, 2])
     # Reshape to prepare input for first layer
-    batch_x = tf.reshape(batch_x, [-1, n_input + 2*n_input*n_context]) # (n_steps*batch_size, n_input + 2*n_input*n_context)
+    batch_x = tf.reshape(batch_x,
+                         [-1, n_input + 2 * n_input * n_context])  # (n_steps*batch_size, n_input + 2*n_input*n_context)
     layers['input_reshaped'] = batch_x
 
     # The next three blocks will pass `batch_x` through three hidden layers with
@@ -412,7 +453,8 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
 
     # 1st layer
     b1 = variable_on_worker_level('b1', [n_hidden_1], tf.zeros_initializer())
-    h1 = variable_on_worker_level('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.contrib.layers.xavier_initializer())
+    h1 = variable_on_worker_level('h1', [n_input + 2 * n_input * n_context, n_hidden_1],
+                                  tf.contrib.layers.xavier_initializer())
     layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
     layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
     layers['layer_1'] = layer_1
@@ -444,7 +486,8 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
 
     # We parametrize the RNN implementation as the training and inference graph
     # need to do different things here.
-    output, output_state = fw_cell(inputs=layer_3, dtype=tf.float32, sequence_length=seq_length, initial_state=previous_state)
+    output, output_state = fw_cell(inputs=layer_3, dtype=tf.float32, sequence_length=seq_length,
+                                   initial_state=previous_state)
 
     # Reshape output from a tensor of shape [n_steps, batch_size, n_cell_dim]
     # to a tensor of shape [n_steps*batch_size, n_cell_dim]
@@ -475,20 +518,20 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     # Output shape: [n_steps, batch_size, n_hidden_6]
     return layer_6, layers
 
+
 def decode_with_lm(inputs, sequence_length, beam_width=100,
                    top_paths=1, merge_repeated=True):
-  decoded_ixs, decoded_vals, decoded_shapes, log_probabilities = (
-      custom_op_module.ctc_beam_search_decoder_with_lm(
-          inputs, sequence_length, beam_width=beam_width,
-          model_path=FLAGS.lm_binary_path, trie_path=FLAGS.lm_trie_path, alphabet_path=FLAGS.alphabet_config_path,
-          lm_weight=FLAGS.lm_weight, valid_word_count_weight=FLAGS.valid_word_count_weight,
-          top_paths=top_paths, merge_repeated=merge_repeated))
+    decoded_ixs, decoded_vals, decoded_shapes, log_probabilities = (
+        custom_op_module.ctc_beam_search_decoder_with_lm(
+            inputs, sequence_length, beam_width=beam_width,
+            model_path=FLAGS.lm_binary_path, trie_path=FLAGS.lm_trie_path, alphabet_path=FLAGS.alphabet_config_path,
+            lm_weight=FLAGS.lm_weight, valid_word_count_weight=FLAGS.valid_word_count_weight,
+            top_paths=top_paths, merge_repeated=merge_repeated))
 
-  return (
-      [tf.SparseTensor(ix, val, shape) for (ix, val, shape)
-       in zip(decoded_ixs, decoded_vals, decoded_shapes)],
-      log_probabilities)
-
+    return (
+        [tf.SparseTensor(ix, val, shape) for (ix, val, shape)
+         in zip(decoded_ixs, decoded_vals, decoded_shapes)],
+        log_probabilities)
 
 
 # Accuracy and Loss
@@ -630,7 +673,7 @@ def get_tower_results(model_feeder, optimizer):
                     # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
                     total_loss, avg_loss, distance, mean_edit_distance, decoded, labels = \
-                        calculate_mean_edit_distance_and_loss(model_feeder, i, dropout_rates, reuse=i>0)
+                        calculate_mean_edit_distance_and_loss(model_feeder, i, dropout_rates, reuse=i > 0)
 
                     # Allow for variables to be re-used by the next tower
                     tf.get_variable_scope().reuse_variables()
@@ -707,7 +750,6 @@ def average_gradients(tower_gradients):
     return average_grads
 
 
-
 # Logging
 # =======
 
@@ -719,10 +761,10 @@ def log_variable(variable, gradient=None):
     '''
     name = variable.name
     mean = tf.reduce_mean(variable)
-    tf.summary.scalar(name='%s/mean'   % name, tensor=mean)
+    tf.summary.scalar(name='%s/mean' % name, tensor=mean)
     tf.summary.scalar(name='%s/sttdev' % name, tensor=tf.sqrt(tf.reduce_mean(tf.square(variable - mean))))
-    tf.summary.scalar(name='%s/max'    % name, tensor=tf.reduce_max(variable))
-    tf.summary.scalar(name='%s/min'    % name, tensor=tf.reduce_min(variable))
+    tf.summary.scalar(name='%s/max' % name, tensor=tf.reduce_max(variable))
+    tf.summary.scalar(name='%s/min' % name, tensor=tf.reduce_min(variable))
     tf.summary.histogram(name=name, values=variable)
     if gradient is not None:
         if isinstance(gradient, tf.IndexedSlices):
@@ -740,8 +782,10 @@ def log_grads_and_vars(grads_and_vars):
     for gradient, variable in grads_and_vars:
         log_variable(variable, gradient=gradient)
 
+
 def get_git_revision_hash():
     return subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
+
 
 def get_git_branch():
     return subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).strip()
@@ -783,6 +827,7 @@ def calculate_report(results_tuple):
     samples.sort(key=lambda s: s.wer)
 
     return samples_wer, samples
+
 
 def collect_results(results_tuple, returns):
     r'''
@@ -840,6 +885,7 @@ def stopwatch(start_duration=0):
     else:
         return datetime.datetime.utcnow() - start_duration
 
+
 def format_duration(duration):
     '''Formats the result of an even stopwatch call as hours:minutes:seconds'''
     duration = duration if isinstance(duration, int) else duration.seconds
@@ -858,6 +904,7 @@ PREFIX_GET_JOB = '/get_job_'
 # Global ID counter for all objects requiring an ID
 id_counter = 0
 
+
 def new_id():
     '''Returns a new ID that is unique on process level. Not thread-safe.
 
@@ -867,6 +914,7 @@ def new_id():
     global id_counter
     id_counter += 1
     return id_counter
+
 
 class Sample(object):
     def __init__(self, src, res, loss, mean_edit_distance, sample_wer):
@@ -885,7 +933,9 @@ class Sample(object):
         self.wer = sample_wer
 
     def __str__(self):
-        return 'WER: %f, loss: %f, mean edit distance: %f\n - src: "%s"\n - res: "%s"' % (self.wer, self.loss, self.mean_edit_distance, self.src, self.res)
+        return 'WER: %f, loss: %f, mean edit distance: %f\n - src: "%s"\n - res: "%s"' % (
+        self.wer, self.loss, self.mean_edit_distance, self.src, self.res)
+
 
 class WorkerJob(object):
     def __init__(self, epoch_id, index, set_name, steps, report):
@@ -913,6 +963,7 @@ class WorkerJob(object):
     def __str__(self):
         return 'Job (ID: %d, worker: %d, epoch: %d, set_name: %s)' % (self.id, self.worker, self.index, self.set_name)
 
+
 class Epoch(object):
     '''Represents an epoch that should be executed by the Training Coordinator.
     Creates `num_jobs` `WorkerJob` instances in state 'open'.
@@ -925,6 +976,7 @@ class Epoch(object):
         set_name (str): the name of the data-set - one of 'train', 'dev', 'test'
         report (bool): if this job should produce a WER report
     '''
+
     def __init__(self, index, num_jobs, set_name='train', report=False):
         self.id = new_id()
         self.index = index
@@ -1050,7 +1102,8 @@ class Epoch(object):
         Returns:
             str. printable overall job state
         '''
-        return '%s - jobs open: %d, jobs running: %d, jobs done: %d' % (self.name(), len(self.jobs_open), len(self.jobs_running), len(self.jobs_done))
+        return '%s - jobs open: %d, jobs running: %d, jobs done: %d' % (
+        self.name(), len(self.jobs_open), len(self.jobs_running), len(self.jobs_done))
 
     def __str__(self):
         if not self.done():
@@ -1059,7 +1112,8 @@ class Epoch(object):
         if not self.report:
             return '%s - loss: %f' % (self.name(), self.loss)
 
-        s = '%s - WER: %f, loss: %s, mean edit distance: %f' % (self.name(), self.wer, self.loss, self.mean_edit_distance)
+        s = '%s - WER: %f, loss: %s, mean edit distance: %f' % (
+        self.name(), self.wer, self.loss, self.mean_edit_distance)
         if len(self.samples) > 0:
             line = '\n' + ('-' * 80)
             for sample in self.samples:
@@ -1072,6 +1126,7 @@ class TrainingCoordinator(object):
     class TrainingCoordinationHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         '''Handles HTTP requests from remote workers to the Training Coordinator.
         '''
+
         def _send_answer(self, data=None):
             self.send_response(200)
             self.send_header('content-type', 'text/plain')
@@ -1091,9 +1146,9 @@ class TrainingCoordinator(object):
                     if job:
                         self._send_answer(pickle.dumps(job))
                         return
-                self.send_response(204) # end of training
+                self.send_response(204)  # end of training
             else:
-                self.send_response(202) # not ready yet
+                self.send_response(202)  # not ready yet
             self.end_headers()
 
         def do_POST(self):
@@ -1103,16 +1158,15 @@ class TrainingCoordinator(object):
                 if job:
                     self._send_answer(pickle.dumps(job))
                     return
-                self.send_response(204) # end of training
+                self.send_response(204)  # end of training
             else:
-                self.send_response(202) # not ready yet
+                self.send_response(202)  # not ready yet
             self.end_headers()
 
         def log_message(self, format, *args):
             '''Overriding base method to suppress web handler messages on stdout.
             '''
             return
-
 
     def __init__(self):
         ''' Central training coordination class.
@@ -1124,7 +1178,8 @@ class TrainingCoordinator(object):
         self._lock = Lock()
         self.started = False
         if is_chief:
-            self._httpd = BaseHTTPServer.HTTPServer((FLAGS.coord_host, FLAGS.coord_port), TrainingCoordinator.TrainingCoordinationHandler)
+            self._httpd = BaseHTTPServer.HTTPServer((FLAGS.coord_host, FLAGS.coord_port),
+                                                    TrainingCoordinator.TrainingCoordinationHandler)
 
     def _reset_counters(self):
         self._index_train = 0
@@ -1160,7 +1215,7 @@ class TrainingCoordinator(object):
             gpus_per_worker = len(available_devices)
 
             # Number of batches processed per job per worker
-            batches_per_job  = gpus_per_worker * max(1, FLAGS.iters_per_worker)
+            batches_per_job = gpus_per_worker * max(1, FLAGS.iters_per_worker)
 
             # Number of batches per global step
             batches_per_step = gpus_per_worker * max(1, FLAGS.replicas_to_agg)
@@ -1176,8 +1231,8 @@ class TrainingCoordinator(object):
 
             # Total number of train/dev/test jobs covering their respective whole sets (one epoch)
             self._num_jobs_train = max(1, model_feeder.train.total_batches // batches_per_job)
-            self._num_jobs_dev   = max(1, model_feeder.dev.total_batches   // batches_per_job)
-            self._num_jobs_test  = max(1, model_feeder.test.total_batches  // batches_per_job)
+            self._num_jobs_dev = max(1, model_feeder.dev.total_batches // batches_per_job)
+            self._num_jobs_test = max(1, model_feeder.test.total_batches // batches_per_job)
 
             if FLAGS.epoch < 0:
                 # A negative epoch means to add its absolute number to the epochs already computed
@@ -1220,7 +1275,8 @@ class TrainingCoordinator(object):
         result = False
 
         # Make sure that early stop is enabled and validation part is enabled
-        if (FLAGS.early_stop is True) and (FLAGS.validation_step > 0) and (len(self._dev_losses) >= FLAGS.earlystop_nsteps):
+        if (FLAGS.early_stop is True) and (FLAGS.validation_step > 0) and (
+                len(self._dev_losses) >= FLAGS.earlystop_nsteps):
 
             # Calculate the mean of losses for past epochs
             mean_loss = np.mean(self._dev_losses[-FLAGS.earlystop_nsteps:-1])
@@ -1228,12 +1284,17 @@ class TrainingCoordinator(object):
             std_loss = np.std(self._dev_losses[-FLAGS.earlystop_nsteps:-1])
             # Update the list of losses incurred
             self._dev_losses = self._dev_losses[-FLAGS.earlystop_nsteps:]
-            log_debug('Checking for early stopping (last %d steps) validation loss: %f, with standard deviation: %f and mean: %f' % (FLAGS.earlystop_nsteps, self._dev_losses[-1], std_loss, mean_loss))
+            log_debug(
+                'Checking for early stopping (last %d steps) validation loss: %f, with standard deviation: %f and mean: %f' % (
+                FLAGS.earlystop_nsteps, self._dev_losses[-1], std_loss, mean_loss))
 
             # Check if validation loss has started increasing or is not decreasing substantially, making sure slight fluctuations don't bother the early stopping from working
-            if self._dev_losses[-1] > np.max(self._dev_losses[:-1]) or (abs(self._dev_losses[-1] - mean_loss) < FLAGS.estop_mean_thresh and std_loss < FLAGS.estop_std_thresh):
+            if self._dev_losses[-1] > np.max(self._dev_losses[:-1]) or (abs(
+                    self._dev_losses[-1] - mean_loss) < FLAGS.estop_mean_thresh and std_loss < FLAGS.estop_std_thresh):
                 # Time to early stop
-                log_info('Early stop triggered as (for last %d steps) validation loss: %f with standard deviation: %f and mean: %f' % (FLAGS.earlystop_nsteps, self._dev_losses[-1], std_loss, mean_loss))
+                log_info(
+                    'Early stop triggered as (for last %d steps) validation loss: %f with standard deviation: %f and mean: %f' % (
+                    FLAGS.earlystop_nsteps, self._dev_losses[-1], std_loss, mean_loss))
                 self._dev_losses = []
                 self._end_training()
                 self._train = False
@@ -1249,14 +1310,17 @@ class TrainingCoordinator(object):
                 self._reset_counters()
 
                 # If the training part of the current epoch should generate a WER report
-                is_display_step = FLAGS.display_step > 0 and (FLAGS.display_step == 1 or self._epoch > 0) and (self._epoch % FLAGS.display_step == 0 or self._epoch == self._target_epoch)
+                is_display_step = FLAGS.display_step > 0 and (FLAGS.display_step == 1 or self._epoch > 0) and (
+                            self._epoch % FLAGS.display_step == 0 or self._epoch == self._target_epoch)
                 # Append the training epoch
-                self._epochs_running.append(Epoch(self._epoch, num_jobs_train, set_name='train', report=is_display_step))
+                self._epochs_running.append(
+                    Epoch(self._epoch, num_jobs_train, set_name='train', report=is_display_step))
 
-                if FLAGS.validation_step > 0 and (FLAGS.validation_step == 1 or self._epoch > 0) and self._epoch % FLAGS.validation_step == 0:
+                if FLAGS.validation_step > 0 and (
+                        FLAGS.validation_step == 1 or self._epoch > 0) and self._epoch % FLAGS.validation_step == 0:
                     # The current epoch should also have a validation part
-                    self._epochs_running.append(Epoch(self._epoch, self._num_jobs_dev, set_name='dev', report=is_display_step))
-
+                    self._epochs_running.append(
+                        Epoch(self._epoch, self._num_jobs_dev, set_name='dev', report=is_display_step))
 
                 # Indicating that there were 'new' epoch(s) provided
                 result = True
@@ -1311,14 +1375,14 @@ class TrainingCoordinator(object):
             tries += 1
             try:
                 url = 'http://%s:%d%s' % (FLAGS.coord_host, FLAGS.coord_port, path)
-                log_traffic('Contacting coordinator - url: %s, tries: %d ...' % (url, tries-1))
-                res = urllib.request.urlopen(urllib.request.Request(url, data, { 'content-type': 'text/plain' }))
+                log_traffic('Contacting coordinator - url: %s, tries: %d ...' % (url, tries - 1))
+                res = urllib.request.urlopen(urllib.request.Request(url, data, {'content-type': 'text/plain'}))
                 str = res.read()
                 status = res.getcode()
                 log_traffic('Coordinator responded - url: %s, status: %s' % (url, status))
                 if status == 200:
                     return str
-                if status == 204: # We use 204 (no content) to indicate end of training
+                if status == 204:  # We use 204 (no content) to indicate end of training
                     return default
             except urllib.error.HTTPError as error:
                 log_traffic('Problem reaching coordinator - url: %s, HTTP code: %d' % (url, error.code))
@@ -1429,7 +1493,8 @@ class TrainingCoordinator(object):
                         log_info('%s' % epoch)
             else:
                 # There was no running epoch found for this job - this should never happen.
-                log_error('There is no running epoch of ID %d for job with ID %d. This should never happen.' % (job.epoch_id, job.id))
+                log_error('There is no running epoch of ID %d for job with ID %d. This should never happen.' % (
+                job.epoch_id, job.id))
             return self.get_job(job.worker)
 
         # We are a remote worker and have to hand over to the chief worker by HTTP
@@ -1438,15 +1503,17 @@ class TrainingCoordinator(object):
             result = pickle.loads(result)
         return result
 
+
 def send_token_to_ps(session, kill=False):
     # Sending our token (the task_index as a debug opportunity) to each parameter server.
     # kill switch tokens are negative and decremented by 1 to deal with task_index 0
-    token = -FLAGS.task_index-1 if kill else FLAGS.task_index
+    token = -FLAGS.task_index - 1 if kill else FLAGS.task_index
     kind = 'kill switch' if kill else 'stop'
     for index, enqueue in enumerate(done_enqueues):
         log_debug('Sending %s token to ps %d...' % (kind, index))
-        session.run(enqueue, feed_dict={ token_placeholder: token })
+        session.run(enqueue, feed_dict={token_placeholder: token})
         log_debug('Sent %s token to ps %d.' % (kind, index))
+
 
 def train(server=None):
     r'''
@@ -1518,7 +1585,6 @@ def train(server=None):
     # Apply gradients to modify the model
     apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
-
     if FLAGS.early_stop is True and not FLAGS.validation_step > 0:
         log_warn('Parameter --validation_step needs to be >0 for early stopping to work')
 
@@ -1527,6 +1593,7 @@ def train(server=None):
         Embedded coordination hook-class that will use variables of the
         surrounding Python context.
         '''
+
         def after_create_session(self, session, coord):
             log_debug('Starting queue runners...')
             model_feeder.start_queue_threads(session, coord)
@@ -1550,12 +1617,14 @@ def train(server=None):
 
     # Hook to save TensorBoard summaries
     if FLAGS.summary_secs > 0:
-        hooks.append(tf.train.SummarySaverHook(save_secs=FLAGS.summary_secs, output_dir=FLAGS.summary_dir, summary_op=merge_all_summaries_op))
+        hooks.append(tf.train.SummarySaverHook(save_secs=FLAGS.summary_secs, output_dir=FLAGS.summary_dir,
+                                               summary_op=merge_all_summaries_op))
 
     # Hook wih number of checkpoint files to save in checkpoint_dir
     if FLAGS.train and FLAGS.max_to_keep > 0:
         saver = tf.train.Saver(max_to_keep=FLAGS.max_to_keep)
-        hooks.append(tf.train.CheckpointSaverHook(checkpoint_dir=FLAGS.checkpoint_dir, save_secs=FLAGS.checkpoint_secs, saver=saver))
+        hooks.append(tf.train.CheckpointSaverHook(checkpoint_dir=FLAGS.checkpoint_dir, save_secs=FLAGS.checkpoint_secs,
+                                                  saver=saver))
 
     if len(FLAGS.initialize_from_frozen_model) > 0:
         with tf.gfile.FastGFile(FLAGS.initialize_from_frozen_model, 'rb') as fin:
@@ -1592,7 +1661,7 @@ def train(server=None):
             update_progressbar.current_set_name = None
 
         if (update_progressbar.current_set_name != set_name or
-            update_progressbar.current_job_index == update_progressbar.total_jobs):
+                update_progressbar.current_job_index == update_progressbar.total_jobs):
 
             # finish prev pbar if it exists
             if hasattr(update_progressbar, 'pbar') and update_progressbar.pbar:
@@ -1601,7 +1670,7 @@ def train(server=None):
             update_progressbar.total_jobs = None
             update_progressbar.current_job_index = 0
 
-            current_epoch = COORD._epoch-1
+            current_epoch = COORD._epoch - 1
 
             if set_name == "train":
                 log_info('Training epoch %i...' % current_epoch)
@@ -1620,7 +1689,7 @@ def train(server=None):
             update_progressbar.current_set_name = set_name
 
         if update_progressbar.pbar:
-            update_progressbar.pbar.update(update_progressbar.current_job_index+1, force=True)
+            update_progressbar.pbar.update(update_progressbar.current_job_index + 1, force=True)
 
         update_progressbar.current_job_index += 1
 
@@ -1632,7 +1701,7 @@ def train(server=None):
                                                is_chief=is_chief,
                                                hooks=hooks,
                                                checkpoint_dir=FLAGS.checkpoint_dir,
-                                               save_checkpoint_secs=None, # already taken care of by a hook
+                                               save_checkpoint_secs=None,  # already taken care of by a hook
                                                config=session_config) as session:
             tf.get_default_graph().finalize()
 
@@ -1683,14 +1752,14 @@ def train(server=None):
                         # Reset mean edit distance
                         total_mean_edit_distance = 0.0
                         # Create report results tuple
-                        report_results = ([],[],[],[])
+                        report_results = ([], [], [], [])
                         # Extend the session.run parameters
                         report_params = [results_tuple, mean_edit_distance]
                     else:
                         report_params = []
 
                     # So far the only extra parameter is the feed_dict
-                    extra_params = { 'feed_dict': feed_dict }
+                    extra_params = {'feed_dict': feed_dict}
 
                     step_summary_writer = step_summary_writers.get(job.set_name)
 
@@ -1701,7 +1770,8 @@ def train(server=None):
 
                         log_debug('Starting batch...')
                         # Compute the batch
-                        _, current_step, batch_loss, batch_report, step_summary = session.run([train_op, global_step, loss, report_params, step_summaries_op], **extra_params)
+                        _, current_step, batch_loss, batch_report, step_summary = session.run(
+                            [train_op, global_step, loss, report_params, step_summaries_op], **extra_params)
 
                         # Log step summaries
                         step_summary_writer.add_summary(step_summary, current_step)
@@ -1758,9 +1828,12 @@ def train(server=None):
                   ' or removing the contents of {0}.'.format(FLAGS.checkpoint_dir))
         sys.exit(1)
 
+
 def create_inference_graph(batch_size=1, n_steps=16, use_new_decoder=False):
     # Input tensor will be of shape [batch_size, n_steps, n_input + 2*n_input*n_context]
-    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, n_input + 2*n_input*n_context], name='input_node')
+    input_tensor = tf.placeholder(tf.float32,
+                                  [batch_size, n_steps if n_steps > 0 else None, n_input + 2 * n_input * n_context],
+                                  name='input_node')
     seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
 
     previous_state_c = variable_on_worker_level('previous_state_c', [batch_size, n_cell_dim], initializer=None)
@@ -1860,7 +1933,8 @@ def do_single_file_inference(input_file_path):
         #       over-fitting, we may want to restore an earlier checkpoint.
         checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
         if not checkpoint:
-            log_error('Checkpoint directory ({}) does not contain a valid checkpoint state.'.format(FLAGS.checkpoint_dir))
+            log_error(
+                'Checkpoint directory ({}) does not contain a valid checkpoint state.'.format(FLAGS.checkpoint_dir))
             exit(1)
 
         checkpoint_path = checkpoint.model_checkpoint_path
@@ -1870,18 +1944,18 @@ def do_single_file_inference(input_file_path):
 
         mfcc = audiofile_to_input_vector(input_file_path, n_input, n_context)
 
-        logits = np.empty([0, 1, alphabet.size()+1])
+        logits = np.empty([0, 1, alphabet.size() + 1])
         for i in range(0, len(mfcc), FLAGS.n_steps):
-            chunk = mfcc[i:i+FLAGS.n_steps]
+            chunk = mfcc[i:i + FLAGS.n_steps]
 
             # pad with zeros if not enough steps (len(mfcc) % FLAGS.n_steps != 0)
             if len(chunk) < FLAGS.n_steps:
                 chunk = np.pad(chunk,
-                               ((0, FLAGS.n_steps-len(chunk)), (0, 0)),
+                               ((0, FLAGS.n_steps - len(chunk)), (0, 0)),
                                mode='constant',
                                constant_values=0)
 
-            output = session.run(outputs['outputs'], feed_dict = {
+            output = session.run(outputs['outputs'], feed_dict={
                 inputs['input']: [chunk],
                 inputs['input_lengths']: [len(chunk)],
             })
@@ -1895,8 +1969,7 @@ def do_single_file_inference(input_file_path):
         print(text[0])
 
 
-def main(_) :
-
+def main(_):
     initialize_globals()
 
     if FLAGS.train or FLAGS.test:
@@ -1923,8 +1996,8 @@ def main(_) :
                 # We are a worker and therefore we have to do some work.
                 # Assigns ops to the local worker by default.
                 with tf.device(tf.train.replica_device_setter(
-                               worker_device=worker_device,
-                               cluster=cluster)):
+                        worker_device=worker_device,
+                        cluster=cluster)):
 
                     # Do the training
                     train(server)
@@ -1944,6 +2017,7 @@ def main(_) :
     # Stopping the coordinator
     COORD.stop()
 
-if __name__ == '__main__' :
+
+if __name__ == '__main__':
     create_flags()
     tf.app.run(main)
