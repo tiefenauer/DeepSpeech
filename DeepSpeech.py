@@ -94,8 +94,11 @@ def create_flags():
     # Sample limits
 
     tf.app.flags.DEFINE_integer ('limit_train',      0,           'maximum number of elements to use from train set - 0 means no limit')
+    tf.app.flags.DEFINE_integer ('limit_train_min',  0,           'maximum number of recorded minutes to use from train set - 0 means no limit')
     tf.app.flags.DEFINE_integer ('limit_dev',        0,           'maximum number of elements to use from validation set- 0 means no limit')
+    tf.app.flags.DEFINE_integer ('limit_dev_min',    0,           'maximum number of recorded minutes to use from train set - 0 means no limit')
     tf.app.flags.DEFINE_integer ('limit_test',       0,           'maximum number of elements to use from test set- 0 means no limit')
+    tf.app.flags.DEFINE_integer ('limit_test_min',   0,           'maximum number of recorded minutes to use from train set - 0 means no limit')
 
     # Step widths
 
@@ -1462,18 +1465,21 @@ def train(server=None):
     train_set = DataSet(FLAGS.train_files.split(','),
                         FLAGS.train_batch_size,
                         limit=FLAGS.limit_train,
+                        limit_min=FLAGS.limit_train_min,
                         next_index=lambda i: COORD.get_next_index('train'))
 
     # Reading validation set
     dev_set = DataSet(FLAGS.dev_files.split(','),
                       FLAGS.dev_batch_size,
                       limit=FLAGS.limit_dev,
+                      limit_min=FLAGS.limit_dev_min,
                       next_index=lambda i: COORD.get_next_index('dev'))
 
     # Reading test set
     test_set = DataSet(FLAGS.test_files.split(','),
                        FLAGS.test_batch_size,
                        limit=FLAGS.limit_test,
+                       limit_min=FLAGS.limit_test_min,
                        next_index=lambda i: COORD.get_next_index('test'))
 
     # Combining all sets to a multi set model feeder

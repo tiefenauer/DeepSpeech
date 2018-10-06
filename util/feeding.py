@@ -3,6 +3,8 @@ import tensorflow as tf
 
 from threading import Thread
 from math import ceil
+
+from pydub.utils import mediainfo
 from six.moves import range
 from util.audio import audiofile_to_input_vector
 from util.gpu import get_available_gpus
@@ -82,7 +84,7 @@ class DataSet(object):
     Represents a collection of audio samples and their respective transcriptions.
     Takes a set of CSV files produced by importers in /bin.
     '''
-    def __init__(self, csvs, batch_size, skip=0, limit=0, ascending=True, next_index=lambda i: i + 1):
+    def __init__(self, csvs, batch_size, skip=0, limit=0, limit_min=0, ascending=True, next_index=lambda i: i + 1):
         self.batch_size = batch_size
         self.next_index = next_index
         self.files = None
@@ -97,6 +99,13 @@ class DataSet(object):
                          .values[skip:]
         if limit > 0:
             self.files = self.files[:limit]
+        elif limit_min:
+            ix, sum_min = 0, 0
+            for ix, file in enumerate(self.files):
+                sum_min += mediainfo(file)['duration']
+                if sum_min > limit_min:
+                    break
+            self.files = self.files[:ix]
         self.total_batches = int(ceil(len(self.files) / batch_size))
 
 class _DataSetLoader(object):
